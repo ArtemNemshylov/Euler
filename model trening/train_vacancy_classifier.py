@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_vacancy_classifier.py (robust compat for old/new transformers)
-- positives: vacancies_clean.jsonl -> {"url": "...", "text": "..."}
-- negatives: output.jsonl          -> довільні ключі; текст дістається автоматично
-- Під 12GB VRAM: xlm-roberta-base, MAX_LENGTH=512, batch=8, grad_acc=2, epochs=6, fp16=True
+train_vacancy_classifier.py (CUDA-aware, old/new transformers compatible)
+
+Вхід:
+  - positives: vacancies_clean.jsonl -> {"url": "...", "text": "..."}
+  - negatives: output.jsonl          -> довільні ключі; текст витягується автоматично
+
+Особливості:
+  - Автовизначення CUDA. Якщо GPU є — FP16, нормальні параметри. Якщо ні — легший режим (менше епох, коротший max_len, менші батчі).
+  - Сумісність зі старими версіями transformers (без evaluation_strategy тощо).
+  - BCEWithLogitsLoss (+ pos_weight), метрики: acc/prec/recall/F1/ROC-AUC/LogLoss.
+  - EarlyStopping тільки якщо підтримується.
+  - Фільтрація зайвих kwargs до моделі (fix num_items_in_batch).
 """
 
 import os, json, inspect
@@ -28,11 +36,12 @@ except Exception:
 
 from bs4 import BeautifulSoup
 
-# ───────── CONFIG ─────────
+# ───────── USER I/O ─────────
 POSITIVES = "vacancies_clean.jsonl"   # {"url": "...", "text": "..."}
-NEGATIVES = "output.jsonl"
-TEXT_FIELD: Optional[str] = None
+NEGATIVES = "output.jsonl"            # довільні ключі, дістанемо текст автоматично
+TEXT_FIELD: Optional[str] = None      # якщо знаєш точний ключ тексту в negatives — впиши тут
 
+# ───────── базові гіперпараметри (будуть автокориговані нижче) ─────────
 MODEL_ID = "xlm-roberta-base"
 OUTPUT_DIR = "vacancy_clf"
 
@@ -43,22 +52,23 @@ GRAD_ACC = 2
 LR = 2e-5
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.10
-LR_SCHEDULER = "cosine"   # може бути відсутній у дуже старих версіях
+LR_SCHEDULER = "cosine"       # у дуже старих transformers може бути відсутній
 MAX_LENGTH = 512
 VAL_SIZE = 0.1
 PATIENCE = 3
 GRADIENT_CHECKPOINTING = False
-FP16 = True
+FP16 = True                   # буде вимкнено на CPU
 BF16 = False
 
 FREEZE_EMBEDDINGS = False
 USE_CLASS_WEIGHT = True
 
 LOGGING_STEPS = 50
-EVAL_STEPS = None
+EVAL_STEPS = None             # якщо None — порахуємо динамічно
 SAVE_TOTAL_LIMIT = 3
 
 TEXT_KEYS_CANDIDATES = ("text","content","clean_text","body","html","description_html","article","data","raw")
+
 
 # ───────── compat helpers ─────────
 def supports_arg(cls, name: str) -> bool:
@@ -73,6 +83,7 @@ def filter_kwargs(cls, kwargs: dict) -> dict:
     except Exception:
         return {}
     return {k: v for k, v in kwargs.items() if k in params}
+
 
 # ───────── IO & parsing ─────────
 def file_info(path: str) -> Tuple[bool, int]:
@@ -156,12 +167,13 @@ def build_dataset(pos_path: str, neg_path: str, text_field: Optional[str]=None) 
         raise ValueError("Порожній датасет.")
     return Dataset.from_list(rows)
 
+
 # ───────── model/loss ─────────
 class ModelWrap(nn.Module):
     def __init__(self, base: nn.Module, pos_weight: Optional[torch.Tensor]=None):
         super().__init__(); self.base=base; self.pos_weight=pos_weight
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        # фільтруємо kwargs під сигнатуру base.forward (щоб прибрати num_items_in_batch тощо)
+        # фільтруємо kwargs під сигнатуру base.forward (прибирає num_items_in_batch тощо)
         try:
             allowed = set(inspect.signature(self.base.forward).parameters.keys())
             base_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
@@ -175,6 +187,7 @@ class ModelWrap(nn.Module):
             bce=nn.BCEWithLogitsLoss(pos_weight=self.pos_weight) if self.pos_weight is not None else nn.BCEWithLogitsLoss()
             loss=bce(logits, labels)
         return {"loss": loss, "logits": logits}
+
 
 # ───────── metrics/threshold ─────────
 def sigmoid_np(x: np.ndarray) -> np.ndarray:
@@ -221,8 +234,35 @@ def find_best_threshold(logits: np.ndarray, labels: np.ndarray):
             best_f1=f1; best_thr=float(thr); best_scores={"precision": float(pr), "recall": float(rc), "f1": float(f1)}
     return best_thr, best_scores
 
+
 # ───────── main ─────────
 def main():
+    # CUDA/CPU профіль
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        device_name = torch.cuda.get_device_name(0)
+        print(f"[INFO] CUDA detected: {device_name}")
+        # GPU профіль
+        fp16 = True
+        bf16 = False
+        max_length = MAX_LENGTH
+        epochs = EPOCHS
+        batch_size = BATCH_SIZE
+        grad_acc = GRAD_ACC
+        eval_steps_cfg = EVAL_STEPS  # порахуємо нижче, якщо None
+    else:
+        print("[WARN] CUDA not available. Falling back to CPU profile (повільно).")
+        torch.set_num_threads(max(1, os.cpu_count() // 2))
+        # CPU профіль (легший)
+        fp16 = False
+        bf16 = False
+        max_length = 256
+        epochs = 3
+        batch_size = 4
+        grad_acc = 1
+        # рідко валідовуватись, щоб не тормозити
+        eval_steps_cfg = 10**9  # практично вимикає часті eval/save
+
     ok_p, ln_p = file_info(POSITIVES); ok_n, ln_n = file_info(NEGATIVES)
     if not ok_p: raise FileNotFoundError(f"Не знайдено файл: {POSITIVES}")
     if not ok_n: raise FileNotFoundError(f"Не знайдено файл: {NEGATIVES}")
@@ -248,40 +288,51 @@ def main():
     if pos_weight_value is not None: print(f"[INFO] pos_weight = {pos_weight_value:.4f}")
 
     tok = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
-    def tok_fn(batch): return tok(batch["text"], padding=False, truncation=True, max_length=MAX_LENGTH)
+    def tok_fn(batch): return tok(batch["text"], padding=False, truncation=True, max_length=max_length)
     dsd = dsd.map(tok_fn, batched=True, remove_columns=[c for c in ds.column_names if c!="label"])
     dsd = dsd.rename_column("label","labels")
 
     cfg = AutoConfig.from_pretrained(MODEL_ID); cfg.num_labels=1; cfg.problem_type="multi_label_classification"
     base = AutoModelForSequenceClassification.from_pretrained(MODEL_ID, config=cfg)
+
     if FREEZE_EMBEDDINGS:
         if hasattr(base,"roberta"):
             for p in base.roberta.embeddings.parameters(): p.requires_grad=False
         elif hasattr(base,"xlm_roberta"):
             for p in base.xlm_roberta.embeddings.parameters(): p.requires_grad=False
 
-    pos_w_tensor = torch.tensor([pos_weight_value]) if (USE_CLASS_WEIGHT and pos_weight_value is not None) else None
-    model = ModelWrap(base=base, pos_weight=pos_w_tensor)
+    model = ModelWrap(base=base, pos_weight=torch.tensor([pos_weight_value]) if (USE_CLASS_WEIGHT and pos_weight_value is not None) else None)
+
+    # перенесення моделі на GPU якщо є
+    if use_cuda:
+        model.cuda()
+
     collator = DataCollatorWithPadding(tokenizer=tok)
 
     train_len = len(dsd["train"])
-    steps_per_epoch = max(1, train_len // (BATCH_SIZE))
+    steps_per_epoch = max(1, train_len // (batch_size))
     dyn_eval_steps = max(100, steps_per_epoch // 2)
-    eval_steps_used = dyn_eval_steps if EVAL_STEPS is None else EVAL_STEPS
+    eval_steps_used = dyn_eval_steps if eval_steps_cfg is None else eval_steps_cfg
     print(f"[INFO] steps_per_epoch={steps_per_epoch} | eval_steps={eval_steps_used}")
 
-    # TrainingArguments з урахуванням версії
+    # TrainingArguments: будуємо з урахуванням версії transformers
     ta_kwargs = dict(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=EPOCHS,
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=max(4,BATCH_SIZE),
-        gradient_accumulation_steps=GRAD_ACC,
+        num_train_epochs=epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=max(4,batch_size),
+        gradient_accumulation_steps=grad_acc,
         learning_rate=LR, weight_decay=WEIGHT_DECAY, warmup_ratio=WARMUP_RATIO,
         logging_steps=LOGGING_STEPS, save_total_limit=SAVE_TOTAL_LIMIT,
-        fp16=FP16, bf16=BF16, gradient_checkpointing=GRADIENT_CHECKPOINTING,
+        fp16=fp16, bf16=bf16, gradient_checkpointing=GRADIENT_CHECKPOINTING,
         dataloader_num_workers=2, report_to=["none"],
     )
+    # pin_memory/ no_cuda — крос-версійно, через перевірку
+    if supports_arg(TrainingArguments, "dataloader_pin_memory"):
+        ta_kwargs["dataloader_pin_memory"] = use_cuda
+    if supports_arg(TrainingArguments, "no_cuda"):
+        ta_kwargs["no_cuda"] = (not use_cuda)
+
     has_eval_strategy = supports_arg(TrainingArguments, "evaluation_strategy")
     if supports_arg(TrainingArguments, "lr_scheduler_type"):
         ta_kwargs["lr_scheduler_type"] = LR_SCHEDULER
@@ -299,8 +350,9 @@ def main():
         if supports_arg(TrainingArguments, "greater_is_better"):
             ta_kwargs["greater_is_better"] = True
     else:
+        # старі версії без evaluation_strategy
         if supports_arg(TrainingArguments, "evaluate_during_training"):
-            ta_kwargs["evaluate_during_training"] = True
+            ta_kwargs["evaluate_during_training"] = (eval_steps_used < 10**9)
         for k in ("load_best_model_at_end","save_strategy","save_steps","eval_steps","metric_for_best_model","greater_is_better"):
             ta_kwargs.pop(k, None)
 
@@ -312,7 +364,7 @@ def main():
         tokenizer=tok, data_collator=collator,
         compute_metrics=compute_metrics_builder(threshold=0.5),
     )
-    if EarlyStoppingCallback is not None and supports_arg(Trainer, "callbacks") and has_eval_strategy:
+    if EarlyStoppingCallback is not None and supports_arg(Trainer, "callbacks") and has_eval_strategy and (eval_steps_used < 10**9):
         tr_kwargs["callbacks"] = [EarlyStoppingCallback(early_stopping_patience=PATIENCE)]
 
     trainer = Trainer(**filter_kwargs(Trainer, tr_kwargs))
@@ -362,6 +414,7 @@ if __name__=='__main__':
 """)
 
     print("Saved to:", OUTPUT_DIR)
+
 
 if __name__ == "__main__":
     main()
