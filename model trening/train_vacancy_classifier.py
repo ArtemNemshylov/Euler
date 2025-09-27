@@ -161,7 +161,13 @@ class ModelWrap(nn.Module):
     def __init__(self, base: nn.Module, pos_weight: Optional[torch.Tensor]=None):
         super().__init__(); self.base=base; self.pos_weight=pos_weight
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        out=self.base(input_ids=input_ids, attention_mask=attention_mask, labels=None, **kwargs)
+        # фільтруємо kwargs під сигнатуру base.forward (щоб прибрати num_items_in_batch тощо)
+        try:
+            allowed = set(inspect.signature(self.base.forward).parameters.keys())
+            base_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+        except Exception:
+            base_kwargs = {}
+        out = self.base(input_ids=input_ids, attention_mask=attention_mask, labels=None, **base_kwargs)
         logits=out.logits
         loss=None
         if labels is not None:
@@ -264,7 +270,7 @@ def main():
     eval_steps_used = dyn_eval_steps if EVAL_STEPS is None else EVAL_STEPS
     print(f"[INFO] steps_per_epoch={steps_per_epoch} | eval_steps={eval_steps_used}")
 
-    # побудова TrainingArguments з урахуванням сумісності
+    # TrainingArguments з урахуванням версії
     ta_kwargs = dict(
         output_dir=OUTPUT_DIR,
         num_train_epochs=EPOCHS,
@@ -276,7 +282,6 @@ def main():
         fp16=FP16, bf16=BF16, gradient_checkpointing=GRADIENT_CHECKPOINTING,
         dataloader_num_workers=2, report_to=["none"],
     )
-    # нові параметри — лише якщо підтримуються
     has_eval_strategy = supports_arg(TrainingArguments, "evaluation_strategy")
     if supports_arg(TrainingArguments, "lr_scheduler_type"):
         ta_kwargs["lr_scheduler_type"] = LR_SCHEDULER
@@ -294,16 +299,13 @@ def main():
         if supports_arg(TrainingArguments, "greater_is_better"):
             ta_kwargs["greater_is_better"] = True
     else:
-        # СТАРА ВЕРСІЯ: без evaluation_strategy. Приберемо конфлікти.
         if supports_arg(TrainingArguments, "evaluate_during_training"):
             ta_kwargs["evaluate_during_training"] = True
-        # НЕ передаємо load_best_model_at_end/save_strategy/eval_steps — щоб не було конфлікту
         for k in ("load_best_model_at_end","save_strategy","save_steps","eval_steps","metric_for_best_model","greater_is_better"):
             ta_kwargs.pop(k, None)
 
     train_args = TrainingArguments(**filter_kwargs(TrainingArguments, ta_kwargs))
 
-    # Trainer kwargs
     tr_kwargs = dict(
         model=model, args=train_args,
         train_dataset=dsd["train"], eval_dataset=dsd["test"],
@@ -320,7 +322,7 @@ def main():
     metrics = trainer.evaluate()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with open(os.path.join(OUTPUT_DIR,"eval_metrics.json"),"w",encoding="utf-8") as f:
-        json.dump({k: float(v) for k,v in metrics.items()}, f, ensure_ascii=False, indent=2)
+        json.dump({k: float(v) for k, v in metrics.items()}, f, ensure_ascii=False, indent=2)
 
     preds = trainer.predict(dsd["test"])
     logits = preds.predictions; labels = preds.label_ids
