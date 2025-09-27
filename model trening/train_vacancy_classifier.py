@@ -170,22 +170,36 @@ def build_dataset(pos_path: str, neg_path: str, text_field: Optional[str]=None) 
 
 # ───────── model/loss ─────────
 class ModelWrap(nn.Module):
-    def __init__(self, base: nn.Module, pos_weight: Optional[torch.Tensor]=None):
-        super().__init__(); self.base=base; self.pos_weight=pos_weight
+    def __init__(self, base: nn.Module, pos_weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.base = base
+        self.pos_weight = pos_weight  # може бути на CPU — перенесемо у forward
+
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        # фільтруємо kwargs під сигнатуру base.forward (прибирає num_items_in_batch тощо)
+        # відфільтруємо зайві kwargs (num_items_in_batch тощо)
         try:
             allowed = set(inspect.signature(self.base.forward).parameters.keys())
             base_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
         except Exception:
             base_kwargs = {}
+
         out = self.base(input_ids=input_ids, attention_mask=attention_mask, labels=None, **base_kwargs)
-        logits=out.logits
-        loss=None
+        logits = out.logits  # (bs, 1)
+
+        loss = None
         if labels is not None:
-            labels=labels.float().unsqueeze(-1)
-            bce=nn.BCEWithLogitsLoss(pos_weight=self.pos_weight) if self.pos_weight is not None else nn.BCEWithLogitsLoss()
-            loss=bce(logits, labels)
+            # привести labels до того ж девайсу та dtype, що й logits
+            labels = labels.to(logits.device).type_as(logits).unsqueeze(-1)
+
+            # pos_weight теж на той самий девайс
+            if self.pos_weight is not None:
+                pw = self.pos_weight.to(logits.device).type_as(logits)
+                bce = nn.BCEWithLogitsLoss(pos_weight=pw)
+            else:
+                bce = nn.BCEWithLogitsLoss()
+
+            loss = bce(logits, labels)
+
         return {"loss": loss, "logits": logits}
 
 
